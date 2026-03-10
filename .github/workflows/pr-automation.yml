@@ -1,0 +1,182 @@
+name: PR Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-label:
+    name: Auto Label PR
+    runs-on: ubuntu-latest
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Label based on changed files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            const labels = new Set();
+            for (const file of files) {
+              const path = file.filename;
+              if (path.startsWith('.github/workflows/')) labels.add('ci/cd');
+              if (path.endsWith('.js')) labels.add('javascript');
+              if (path === 'wrangler.toml') labels.add('infrastructure');
+              if (path.startsWith('test/')) labels.add('tests');
+              if (path === 'package.json' || path === 'package-lock.json') labels.add('dependencies');
+            }
+
+            // Size label
+            const totalChanges = files.reduce((sum, f) => sum + f.additions + f.deletions, 0);
+            if (totalChanges < 10) labels.add('size/xs');
+            else if (totalChanges < 50) labels.add('size/s');
+            else if (totalChanges < 200) labels.add('size/m');
+            else if (totalChanges < 500) labels.add('size/l');
+            else labels.add('size/xl');
+
+            if (labels.size > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: [...labels]
+              });
+            }
+
+  conflict-check:
+    name: Check for Merge Conflicts
+    runs-on: ubuntu-latest
+    if: github.event.action == 'opened' || github.event.action == 'synchronize'
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Check if branch is up to date
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            if (pr.mergeable === false) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: '**Merge conflict detected.** Please rebase or merge the target branch to resolve conflicts before this PR can be merged.'
+              });
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['conflict']
+              });
+            }
+
+  auto-merge-dependabot:
+    name: Auto-merge Dependabot
+    runs-on: ubuntu-latest
+    if: github.event.action == 'opened' && github.actor == 'dependabot[bot]'
+    timeout-minutes: 5
+
+    steps:
+      - name: Auto-approve dependabot PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Only auto-merge patch and minor updates
+            const title = context.payload.pull_request.title.toLowerCase();
+            const isMinorOrPatch = !title.includes('major');
+
+            if (isMinorOrPatch) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                event: 'APPROVE',
+                body: 'Auto-approved: minor/patch dependency update'
+              });
+
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.issue.number,
+                merge_method: 'squash'
+              });
+            }
+
+  auto-merge-on-approval:
+    name: Auto-merge on Approval
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request_review'
+      && github.event.review.state == 'approved'
+    timeout-minutes: 5
+
+    steps:
+      - name: Check CI and merge if ready
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+
+            // Check if auto-merge label is present
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number
+            });
+
+            const hasAutoMerge = labels.some(l => l.name === 'auto-merge');
+            if (!hasAutoMerge) {
+              console.log('No auto-merge label, skipping');
+              return;
+            }
+
+            // Check all status checks passed
+            const { data: checks } = await github.rest.checks.listForRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: pr.head.sha
+            });
+
+            const allPassed = checks.check_runs.every(
+              check => check.conclusion === 'success' || check.conclusion === 'skipped'
+            );
+
+            if (allPassed) {
+              await github.rest.pulls.merge({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pr.number,
+                merge_method: 'squash'
+              });
+              console.log('PR merged successfully');
+            } else {
+              console.log('Not all checks passed, skipping merge');
+            }

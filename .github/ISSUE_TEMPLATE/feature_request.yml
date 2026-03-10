@@ -1,0 +1,33 @@
+name: Feature Request
+description: Suggest a new feature for RoadCommand
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature Description
+      description: Describe the feature you'd like.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: Why would this be useful?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - API Routing
+        - Memory / Continuity
+        - Rate Limiting
+        - Cost Optimization
+        - CI/CD
+        - Other
+    validations:
+      required: true
