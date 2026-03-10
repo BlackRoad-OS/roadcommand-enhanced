@@ -1,0 +1,172 @@
+name: Issue Management
+
+on:
+  issues:
+    types: [opened, labeled]
+  schedule:
+    # Run stale check weekly on Mondays
+    - cron: '0 9 * * 1'
+
+permissions:
+  issues: write
+
+jobs:
+  auto-triage:
+    name: Auto-triage New Issues
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    timeout-minutes: 5
+
+    steps:
+      - name: Triage and label issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title.toLowerCase();
+            const body = (issue.body || '').toLowerCase();
+            const content = title + ' ' + body;
+            const labels = [];
+
+            // Auto-categorize
+            if (content.includes('bug') || content.includes('error') || content.includes('crash') || content.includes('broken')) {
+              labels.push('bug');
+            }
+            if (content.includes('feature') || content.includes('request') || content.includes('enhancement') || content.includes('add')) {
+              labels.push('enhancement');
+            }
+            if (content.includes('deploy') || content.includes('workflow') || content.includes('ci') || content.includes('cd')) {
+              labels.push('ci/cd');
+            }
+            if (content.includes('rate limit') || content.includes('429') || content.includes('throttl')) {
+              labels.push('rate-limiting');
+            }
+            if (content.includes('api') || content.includes('endpoint') || content.includes('route')) {
+              labels.push('api');
+            }
+            if (content.includes('security') || content.includes('vulnerability') || content.includes('auth')) {
+              labels.push('security');
+            }
+
+            // Default label if nothing matched
+            if (labels.length === 0) {
+              labels.push('needs-triage');
+            }
+
+            labels.push('new');
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              labels
+            });
+
+            // Welcome message for first-time contributors
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              creator: issue.user.login,
+              state: 'all'
+            });
+
+            if (issues.length <= 1) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Thanks for opening your first issue, @${issue.user.login}! We'll review this shortly.`
+              });
+            }
+
+  stale-issues:
+    name: Close Stale Issues
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 10
+
+    steps:
+      - name: Mark and close stale issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const daysBeforeStale = 30;
+            const daysBeforeClose = 7;
+            const now = new Date();
+
+            // Get open issues
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              sort: 'updated',
+              direction: 'asc',
+              per_page: 100
+            });
+
+            for (const issue of issues) {
+              // Skip PRs
+              if (issue.pull_request) continue;
+              // Skip pinned or important labels
+              const labels = issue.labels.map(l => l.name);
+              if (labels.includes('pinned') || labels.includes('security') || labels.includes('in-progress')) continue;
+
+              const lastUpdated = new Date(issue.updated_at);
+              const daysSinceUpdate = (now - lastUpdated) / (1000 * 60 * 60 * 24);
+
+              if (labels.includes('stale') && daysSinceUpdate > daysBeforeClose) {
+                // Close stale issues that haven't had activity
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'not_planned'
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: 'Closing this issue due to inactivity. Feel free to reopen if still relevant.'
+                });
+              } else if (daysSinceUpdate > daysBeforeStale && !labels.includes('stale')) {
+                // Mark as stale
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: ['stale']
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  body: 'This issue has been automatically marked as stale due to 30 days of inactivity. It will be closed in 7 days if no further activity occurs.'
+                });
+              }
+            }
+
+  remove-stale-on-activity:
+    name: Remove Stale Label on Activity
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && github.event.action == 'labeled'
+    timeout-minutes: 5
+
+    steps:
+      - name: Remove stale if new label added (shows activity)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // If any label other than 'stale' is added, remove stale
+            if (context.payload.label.name !== 'stale') {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.issue.number,
+                  name: 'stale'
+                });
+              } catch (e) {
+                // Label might not exist, that's fine
+              }
+            }
